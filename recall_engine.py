@@ -1127,6 +1127,119 @@ def ensure_runtime_dirs(*dirs: Path) -> None:
         d.mkdir(parents=True, exist_ok=True)
 
 
+# ─── Per-pattern notes stamper ───────────────────────────────────────────────
+
+_TEMPLATE_CANONICAL_RE = re.compile(r"^##\s+Canonical:\s*(.+?)\s*$")
+_TEMPLATE_VARIANT_RE = re.compile(r"^###\s+(.+?)\s*$")
+_VARIANTS_HEADER_RE = re.compile(r"^##\s+Variants\s*$")
+_NOTES_PROBLEM_HEADING_RE = re.compile(r"^##\s+(.+?)\s*$")
+_TEMPLATE_LINK_RE = re.compile(r"^\[([^\]]+)\]\([^)]+\)\s*$")
+_PROBLEM_PATTERN_RE = re.compile(r"^\[([^\]]+)\]\s*->\s*")
+
+
+def _strip_link(text: str) -> str:
+    """`[Name](url)` → `Name`. Idempotent on text without a link."""
+    m = _TEMPLATE_LINK_RE.match(text.strip())
+    return m.group(1) if m else text.strip()
+
+
+def parse_template_problems(template_md: str) -> list[str]:
+    """Problem names from a pattern template, in document order.
+
+    Reads the `## Canonical: [Name](url)` heading and every `### [Name](url)`
+    under `## Variants`. Markdown link syntax is stripped — heading bodies
+    return as plain `Name`."""
+    names: list[str] = []
+    in_variants = False
+    for raw in template_md.splitlines():
+        line = raw.rstrip()
+        canonical = _TEMPLATE_CANONICAL_RE.match(line)
+        if canonical:
+            names.append(_strip_link(canonical.group(1)))
+            in_variants = False
+            continue
+        if _VARIANTS_HEADER_RE.match(line):
+            in_variants = True
+            continue
+        if in_variants and line.startswith("## "):
+            in_variants = False
+            continue
+        if in_variants:
+            variant = _TEMPLATE_VARIANT_RE.match(line)
+            if variant:
+                names.append(_strip_link(variant.group(1)))
+    return names
+
+
+def _existing_problem_headings(notes_md: str) -> set[str]:
+    """Every `## ...` heading body already present in a notes file."""
+    return {
+        m.group(1).strip()
+        for raw in notes_md.splitlines()
+        for m in [_NOTES_PROBLEM_HEADING_RE.match(raw.rstrip())]
+        if m
+    }
+
+
+def stamp_notes(template_md: str, existing: str | None, pattern_label: str) -> str:
+    """Notes-file content for one pattern.
+
+    Fresh (`existing` None/empty): `# <Pattern> — Notes` H1 + one empty
+    `## <Problem>` section per template problem.
+
+    Merge: existing content is preserved verbatim — every line, including
+    any user-invented sections — and missing problem stubs are appended
+    at the end."""
+    problem_names = parse_template_problems(template_md)
+
+    if not existing:
+        lines = [f"# {pattern_label} — Notes", ""]
+        for name in problem_names:
+            lines.append(f"## {name}")
+            lines.append("")
+        return "\n".join(lines) + "\n"
+
+    existing_headings = _existing_problem_headings(existing)
+    missing = [n for n in problem_names if n not in existing_headings]
+    if not missing:
+        return existing
+
+    body = existing if existing.endswith("\n") else existing + "\n"
+    if not body.endswith("\n\n"):
+        body += "\n"
+    for name in missing:
+        body += f"## {name}\n\n"
+    return body
+
+
+def _pattern_label_from_template(template_md: str) -> str | None:
+    """The H1 of a pattern template — `# Sliding Window` → `Sliding Window`."""
+    for raw in template_md.splitlines():
+        line = raw.strip()
+        if line.startswith("# ") and not line.startswith("## "):
+            return line[2:].strip()
+    return None
+
+
+def ensure_notes_stamped(
+    template_path: Path, notes_path: Path, *, pattern_label: str
+) -> bool:
+    """Stamp `notes_path` from `template_path` if missing; merge missing problem
+    stubs if it already exists. Returns True iff content changed.
+
+    Silently no-ops when the template doesn't exist — some curriculum patterns
+    may not have a `patterns/<slug>.md` yet."""
+    if not template_path.exists():
+        return False
+    template_md = template_path.read_text()
+    existing = notes_path.read_text() if notes_path.exists() else None
+    new_body = stamp_notes(template_md, existing, pattern_label)
+    if new_body == existing:
+        return False
+    _atomic_write(notes_path, new_body)
+    return True
+
+
 # ─── DSA sync (curriculum.md ↔ ledger) ───────────────────────────────────────
 
 
@@ -1809,6 +1922,7 @@ def recompute(
     recall_limit: int = DEFAULT_RECALL_LIMIT,
     dry_run: bool = False,
     hardest_ledger_path: Path | None = None,
+    patterns_dir: Path | None = None,
 ) -> RecomputeResult:
     """One full cycle: log new completions, fold mock edits, regenerate today.md.
 
@@ -1860,9 +1974,31 @@ def recompute(
             err=True,
         )
 
-    logged = append_to_ledger(ledger_path, parse_completions(today_md))
+    today_completions = parse_completions(today_md)
+    logged = append_to_ledger(ledger_path, today_completions)
     if plan.additions and not dry_run:
         logged += append_to_ledger(ledger_path, plan.additions)
+
+    # Auto-stamp per-pattern notes for any pattern whose problems were touched
+    # this cycle. Idempotent: no-op once the notes file already covers every
+    # template problem. Preserves all existing user content.
+    if patterns_dir is not None and not dry_run:
+        touched_problems = (
+            {t.problem for t in today_completions}
+            | {t.problem for t in plan.additions}
+        )
+        touched_patterns: set[str] = set()
+        for pstr in touched_problems:
+            m = _PROBLEM_PATTERN_RE.match(pstr)
+            if m:
+                touched_patterns.add(m.group(1))
+        for label in touched_patterns:
+            slug = _pattern_to_slug(label)
+            ensure_notes_stamped(
+                patterns_dir / f"{slug}.md",
+                patterns_dir / f"{slug}.notes.md",
+                pattern_label=label,
+            )
 
     # Hardest marks: parse ticks under `## Today's hardest (DATE)`. The date
     # in the heading (rendered when today.md was generated) tells us which
@@ -1985,12 +2121,20 @@ def cli() -> None:
     is_flag=True,
     help="Preview destructive ledger purges (from DSA unchecks in curriculum.md) without applying.",
 )
+@click.option(
+    "--patterns-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=Path("patterns"),
+    show_default=True,
+    help="Directory of `<slug>.md` pattern templates. Touched patterns get their `.notes.md` stamped (preserving existing notes).",
+)
 def recompute_cmd(
     curriculum: Path,
     today_md: Path,
     ledger: Path,
     hardest_ledger: Path,
     dry_run: bool,
+    patterns_dir: Path,
 ) -> None:
     """Fold yesterday's checks into the ledger, then regenerate today.md."""
     result = recompute(
@@ -2000,6 +2144,7 @@ def recompute_cmd(
         today=date.today(),
         dry_run=dry_run,
         hardest_ledger_path=hardest_ledger,
+        patterns_dir=patterns_dir if patterns_dir.exists() else None,
     )
     maint_suffix = (
         f" · maintenance: {result.maintenance_size}" if result.maintenance_size else ""
@@ -2235,6 +2380,52 @@ def init_cmd(template: Path, curriculum: Path, force: bool) -> None:
             f"{curriculum} already exists — left untouched. "
             f"Pass --force to overwrite from the template."
         )
+
+
+@cli.group(name="notes")
+def notes_cmd() -> None:
+    """Manage per-pattern personal notes files (gitignored)."""
+
+
+@notes_cmd.command(name="init")
+@click.argument("pattern", required=False)
+@click.option(
+    "--patterns-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=Path("patterns"),
+    show_default=True,
+    help="Directory containing `<slug>.md` pattern templates.",
+)
+def notes_init_cmd(pattern: str | None, patterns_dir: Path) -> None:
+    """Stamp a `<slug>.notes.md` file with `## <Problem>` headings from its template.
+
+    Pass a slug (e.g., `sliding-window`) to stamp one pattern, or omit the
+    argument to stamp every template under `patterns/`. Existing notes content
+    is preserved verbatim — only missing problem stubs are appended.
+    """
+    if pattern:
+        slugs = [pattern]
+    else:
+        slugs = sorted(
+            p.stem for p in patterns_dir.glob("*.md")
+            if not p.name.endswith(".notes.md")
+        )
+
+    stamped = 0
+    for slug in slugs:
+        tpath = patterns_dir / f"{slug}.md"
+        if not tpath.exists():
+            click.echo(f"  skip {slug}: no template at {tpath}", err=True)
+            continue
+        label = _pattern_label_from_template(tpath.read_text())
+        if not label:
+            click.echo(f"  skip {slug}: template missing `# Pattern` H1", err=True)
+            continue
+        npath = patterns_dir / f"{slug}.notes.md"
+        if ensure_notes_stamped(tpath, npath, pattern_label=label):
+            stamped += 1
+            click.echo(f"  stamped {npath}")
+    click.echo(f"{stamped} notes file(s) stamped or updated.")
 
 
 @cli.group(name="mock")

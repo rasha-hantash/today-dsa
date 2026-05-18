@@ -2680,3 +2680,265 @@ def test_parse_hardest_marks_handles_wikilinked_pattern_in_ticked_lines() -> Non
     assert len(marks) == 1
     assert marks[0].problem == "[Arrays & Hashing] -> Two Sum"
     assert marks[0].on == date(2026, 5, 12)
+
+
+# ─── Per-pattern notes stamper ────────────────────────────────────────────────
+
+_SAMPLE_TEMPLATE = """# Sliding Window
+
+## Trigger
+
+Some prose.
+
+## Canonical: [Longest Substring Without Repeating Characters](https://leetcode.com/problems/longest-substring-without-repeating-characters/)
+
+### Mistakes
+
+- (none yet)
+
+## Variants
+
+### [Best Time to Buy and Sell Stock](https://leetcode.com/problems/best-time-to-buy-and-sell-stock/)
+
+- (none yet) — track min-so-far
+
+### [Permutation in String](https://leetcode.com/problems/permutation-in-string/)
+
+- (none yet)
+
+## Why these belong together
+
+Closing prose.
+"""
+
+
+def test_parse_template_problems_extracts_canonical_then_variants_in_order() -> None:
+    """Stamping a notes file from a pattern template needs the list of problem
+    names in document order: the Canonical heading first, then each Variant
+    under `## Variants`."""
+    from recall_engine import parse_template_problems
+
+    names = parse_template_problems(_SAMPLE_TEMPLATE)
+
+    assert names == [
+        "Longest Substring Without Repeating Characters",
+        "Best Time to Buy and Sell Stock",
+        "Permutation in String",
+    ]
+
+
+def test_parse_template_problems_strips_markdown_link_syntax() -> None:
+    """Variant headings wrap the name in `[Name](url)`. The stamper needs the
+    bare name — `Name` — to use as the notes section heading."""
+    from recall_engine import parse_template_problems
+
+    md = "## Canonical: [Two Sum](https://example.com)\n\n## Variants\n\n### [Group Anagrams](https://example.com)\n"
+
+    assert parse_template_problems(md) == ["Two Sum", "Group Anagrams"]
+
+
+def test_parse_template_problems_returns_empty_when_template_has_no_canonical_or_variants() -> None:
+    """A pattern template with no Canonical and no Variants section (e.g., a
+    stub pattern doc) yields an empty list — the stamper produces nothing."""
+    from recall_engine import parse_template_problems
+
+    md = "# Some Pattern\n\n## Trigger\n\nprose only\n"
+
+    assert parse_template_problems(md) == []
+
+
+def test_stamp_notes_creates_fresh_file_with_h1_header_and_problem_stubs() -> None:
+    """When no notes file exists yet, stamp_notes returns a fresh body with the
+    `# <Pattern> — Notes` H1 and one `## <Problem>` stub per template problem."""
+    from recall_engine import stamp_notes
+
+    result = stamp_notes(_SAMPLE_TEMPLATE, existing=None, pattern_label="Sliding Window")
+
+    assert result.startswith("# Sliding Window — Notes\n")
+    assert "## Longest Substring Without Repeating Characters\n" in result
+    assert "## Best Time to Buy and Sell Stock\n" in result
+    assert "## Permutation in String\n" in result
+
+
+def test_stamp_notes_preserves_every_byte_of_existing_user_content() -> None:
+    """The single most important invariant: when merging into an existing
+    notes file, no user-written line may be modified or removed. New stubs
+    are only ever appended at the end."""
+    from recall_engine import stamp_notes
+
+    existing = (
+        "# Sliding Window — Notes\n\n"
+        "## Best Time to Buy and Sell Stock\n\n"
+        "- set profit to 0\n"
+        "- use max(profit, sell - buy)\n"
+    )
+
+    result = stamp_notes(_SAMPLE_TEMPLATE, existing=existing, pattern_label="Sliding Window")
+
+    for line in existing.splitlines():
+        assert line in result.splitlines(), f"Line lost during merge: {line!r}"
+
+
+def test_stamp_notes_does_not_duplicate_problem_sections_already_present() -> None:
+    """If the user already has `## Best Time to Buy and Sell Stock`, stamping
+    must not append a second copy of that heading."""
+    from recall_engine import stamp_notes
+
+    existing = (
+        "# Sliding Window — Notes\n\n"
+        "## Best Time to Buy and Sell Stock\n\n"
+        "- my notes here\n"
+    )
+
+    result = stamp_notes(_SAMPLE_TEMPLATE, existing=existing, pattern_label="Sliding Window")
+
+    assert result.count("## Best Time to Buy and Sell Stock") == 1
+
+
+def test_stamp_notes_appends_only_missing_problem_stubs() -> None:
+    """Existing notes already cover one variant. The stamp adds stubs for the
+    canonical + the other variant, but leaves the existing one alone."""
+    from recall_engine import stamp_notes
+
+    existing = (
+        "# Sliding Window — Notes\n\n"
+        "## Best Time to Buy and Sell Stock\n\n"
+        "- my mistake\n"
+    )
+
+    result = stamp_notes(_SAMPLE_TEMPLATE, existing=existing, pattern_label="Sliding Window")
+
+    assert "## Longest Substring Without Repeating Characters" in result
+    assert "## Permutation in String" in result
+    assert "- my mistake" in result
+
+
+def test_stamp_notes_preserves_user_added_sections_unknown_to_the_template() -> None:
+    """The user may have invented their own headings (e.g., `## Mistakes
+    (general)`) that aren't in the template. Those must survive the merge."""
+    from recall_engine import stamp_notes
+
+    existing = (
+        "# Sliding Window — Notes\n\n"
+        "## Mistakes (general)\n\n"
+        "- always reset state\n"
+    )
+
+    result = stamp_notes(_SAMPLE_TEMPLATE, existing=existing, pattern_label="Sliding Window")
+
+    assert "## Mistakes (general)" in result
+    assert "- always reset state" in result
+
+
+def test_stamp_notes_is_idempotent_when_run_twice() -> None:
+    """Running stamp twice on the same template must produce the same result —
+    no extra stubs, no shuffling."""
+    from recall_engine import stamp_notes
+
+    once = stamp_notes(_SAMPLE_TEMPLATE, existing=None, pattern_label="Sliding Window")
+    twice = stamp_notes(_SAMPLE_TEMPLATE, existing=once, pattern_label="Sliding Window")
+
+    assert once == twice
+
+
+def test_ensure_notes_stamped_creates_file_on_first_call(tmp_path: Path) -> None:
+    """Filesystem integration: `ensure_notes_stamped` writes the stamped body
+    to disk when no notes file exists yet, and returns True to signal it
+    changed the world."""
+    from recall_engine import ensure_notes_stamped
+
+    template = tmp_path / "sliding-window.md"
+    template.write_text(_SAMPLE_TEMPLATE)
+    notes = tmp_path / "sliding-window.notes.md"
+
+    changed = ensure_notes_stamped(template, notes, pattern_label="Sliding Window")
+
+    assert changed is True
+    assert notes.exists()
+    body = notes.read_text()
+    assert body.startswith("# Sliding Window — Notes")
+    assert "## Best Time to Buy and Sell Stock" in body
+
+
+def test_ensure_notes_stamped_is_a_noop_when_no_new_problems_to_add(tmp_path: Path) -> None:
+    """If the notes file already contains every template problem, the second
+    invocation must NOT rewrite the file (no spurious mtime bump)."""
+    from recall_engine import ensure_notes_stamped
+
+    template = tmp_path / "sliding-window.md"
+    template.write_text(_SAMPLE_TEMPLATE)
+    notes = tmp_path / "sliding-window.notes.md"
+
+    ensure_notes_stamped(template, notes, pattern_label="Sliding Window")
+    first_body = notes.read_text()
+    changed_again = ensure_notes_stamped(template, notes, pattern_label="Sliding Window")
+    second_body = notes.read_text()
+
+    assert changed_again is False
+    assert first_body == second_body
+
+
+def test_ensure_notes_stamped_does_nothing_when_template_does_not_exist(tmp_path: Path) -> None:
+    """Some patterns may not have a `patterns/<slug>.md` template yet (e.g.,
+    a pattern that was added to curriculum.md before its template was
+    written). The stamper must silently skip these — no crash, no notes file."""
+    from recall_engine import ensure_notes_stamped
+
+    template = tmp_path / "missing.md"
+    notes = tmp_path / "missing.notes.md"
+
+    changed = ensure_notes_stamped(template, notes, pattern_label="Missing Pattern")
+
+    assert changed is False
+    assert not notes.exists()
+
+
+def test_recompute_auto_stamps_notes_for_a_pattern_on_first_tick(tmp_path: Path) -> None:
+    """Integration: when a problem is ticked in today.md and `patterns_dir` is
+    passed, recompute lazily creates the pattern's notes file with a fresh
+    H1 + problem stubs derived from the pattern template."""
+    daily = tmp_path / "curriculum.md"
+    daily.write_text(THREE_DAY_CURRICULUM_MD)
+    ledger = tmp_path / "completions.jsonl"
+    today_md = tmp_path / "today.md"
+    today_md.write_text("- [x] [A] -> P1 (Day 1) ✅ 2026-05-06\n")
+
+    patterns_dir = tmp_path / "patterns"
+    patterns_dir.mkdir()
+    (patterns_dir / "a.md").write_text(
+        "# A\n\n## Canonical: [P1](https://example.com)\n\n## Variants\n\n### [P2](https://example.com)\n"
+    )
+
+    recompute(daily, today_md, ledger, today=date(2026, 5, 7), patterns_dir=patterns_dir)
+
+    notes = patterns_dir / "a.notes.md"
+    assert notes.exists()
+    body = notes.read_text()
+    assert "# A — Notes" in body
+    assert "## P1" in body
+    assert "## P2" in body
+
+
+def test_recompute_preserves_existing_notes_when_auto_stamping(tmp_path: Path) -> None:
+    """A user's hand-written notes must survive recompute's auto-stamp pass
+    untouched — only missing problem stubs are appended."""
+    daily = tmp_path / "curriculum.md"
+    daily.write_text(THREE_DAY_CURRICULUM_MD)
+    ledger = tmp_path / "completions.jsonl"
+    today_md = tmp_path / "today.md"
+    today_md.write_text("- [x] [A] -> P1 (Day 1) ✅ 2026-05-06\n")
+
+    patterns_dir = tmp_path / "patterns"
+    patterns_dir.mkdir()
+    (patterns_dir / "a.md").write_text(
+        "# A\n\n## Canonical: [P1](https://example.com)\n\n## Variants\n\n### [P2](https://example.com)\n"
+    )
+    notes = patterns_dir / "a.notes.md"
+    notes.write_text("# A — Notes\n\n## P1\n\n- my hard-won insight\n")
+
+    recompute(daily, today_md, ledger, today=date(2026, 5, 7), patterns_dir=patterns_dir)
+
+    body = notes.read_text()
+    assert "- my hard-won insight" in body
+    assert "## P2" in body  # the missing stub was added
+    assert body.count("## P1") == 1  # no duplicate
